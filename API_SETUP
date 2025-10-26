@@ -1,0 +1,675 @@
+# ==============================================================================
+# Script: gemini_menu_setup.py
+# Description: Interactive menu to setup, configure, and manage the active 
+#              Gemini API key using BEJSON 104 and a persistent active_key.json.
+# Version: 3.0.7 (Feature: Added CLI flag --activate-random-key) # <-- VERSION BUMPED
+# Script ID: GEMINI_SETUP_300
+# Author: Gemini Assistant
+# ==============================================================================
+
+import json
+import random
+import sys
+import os
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+import argparse # <--- NEW IMPORT: Required for CLI Argument Parsing
+
+# --- ANSI COLOR CODES ---
+COLOR_GREEN = '\033[92m'    
+COLOR_RED = '\033[91m'      
+COLOR_YELLOW = '\033[93m'   
+COLOR_CYAN = '\033[96m'     
+COLOR_WHITE = '\033[97m'    
+COLOR_END = '\033[0m'       
+
+# The official Google GenAI SDK is used for the API test.
+try:
+    from google import genai
+    from google.genai.errors import APIError
+except ImportError:
+    print(f"{COLOR_RED}Error: 'google-genai' not found. Run: pip install google-genai{COLOR_END}")
+    sys.exit(1)
+
+
+# --- CONFIGURATION CONSTANTS (Names are static, paths are dynamic) ---
+SCRIPT_ID = "GEMINI_SETUP_300"
+
+# Files that follow the DYNAMIC path logic (API Keys)
+CONFIG_SUBDIR_NAME = "config" 
+CONFIG_FILE_NAME = "api_config.json"
+ACTIVE_KEY_FILE_NAME = "active_key.json"
+
+# File that follows the STATIC path logic (Application Settings)
+SETTINGS_FILE_NAME = "app_settings.json" 
+
+GEMINI_SERVICE_NAME = "Gemini"
+MODEL_DEFAULT = "gemini-2.5-flash" 
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# --- STATIC PATH (Settings file is always next to the script) ---
+SETTINGS_PATH = SCRIPT_DIR / SETTINGS_FILE_NAME 
+
+# Default settings: use_relative_config is now TRUE (Relative Mode) by default
+DEFAULT_SETTINGS = {
+    "load_mode": "last", # Options: "last", "random"
+    "use_relative_config": True, # Relative Path Mode ON
+    "external_config_dir": "/ABSOLUTE/PATH/TO/BEJSON/config" # Placeholder
+}
+
+# --- BEJSON 104 TEMPLATE (10 Slots) ---
+KEY_SLOTS = [
+    [
+        GEMINI_SERVICE_NAME,
+        MODEL_DEFAULT, 
+        ""
+    ] for _ in range(10) 
+]
+
+BEJSON_CONFIG_TEMPLATE: Dict[str, Any] = {
+    "Format": "BEJSON",
+    "Format_Version": "104",
+    "Format_Creator": "Elton Boehnen",
+    "Records_Type": ["LLMAPIConfig"],
+    "Fields": [
+        { "name": "service_name", "type": "string" },
+        { "name": "model_name", "type": "string" },
+        { "name": "api_key", "type": "string" }
+    ],
+    "Values": KEY_SLOTS
+}
+
+
+# ==============================================================================
+# --- UTILITY FUNCTIONS ---
+# ==============================================================================
+
+def get_current_paths(settings: Dict[str, Any]) -> Dict[str, Path]:
+    """Dynamically determines the Paths for API key files based on settings."""
+    
+    # 1. Determine the Base Directory for the API Key Files
+    if settings['use_relative_config']:
+        # Relative Mode: Paths are inside the script's './config/' subdirectory
+        key_config_dir = SCRIPT_DIR / CONFIG_SUBDIR_NAME
+        # Ensure directory exists for RELATIVE mode
+        key_config_dir.mkdir(parents=True, exist_ok=True) 
+    else:
+        # External Mode: Paths are defined by the user in 'external_config_dir'
+        key_config_dir = Path(settings['external_config_dir']).expanduser()
+
+    # 2. Return all paths, differentiating between static (settings) and dynamic (keys)
+    return {
+        # Dynamic Paths (Keys/API Config)
+        'KEY_CONFIG_DIR': key_config_dir,
+        'CONFIG_PATH': key_config_dir / CONFIG_FILE_NAME,
+        'ACTIVE_KEY_PATH': key_config_dir / ACTIVE_KEY_FILE_NAME,
+        
+        # Static Path (Application Settings)
+        'SETTINGS_PATH': SETTINGS_PATH 
+    }
+
+def clear_screen():
+    """Clears the console screen in a platform-independent way."""
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        os.system('clear')
+
+def load_settings() -> Dict[str, Any]:
+    """Loads application settings or returns defaults (uses static SETTINGS_PATH)."""
+    if SETTINGS_PATH.exists():
+        try:
+            settings = json.loads(SETTINGS_PATH.read_text())
+            return {**DEFAULT_SETTINGS, **settings}
+        except json.JSONDecodeError:
+            print(f"{COLOR_RED}Warning: Invalid JSON in {SETTINGS_FILE_NAME}. Using defaults.{COLOR_END}")
+            return DEFAULT_SETTINGS
+    return DEFAULT_SETTINGS
+
+def save_settings(settings_data: Dict[str, Any]):
+    """Saves application settings (uses static SETTINGS_PATH)."""
+    try:
+        content = json.dumps(settings_data, indent=2)
+        SETTINGS_PATH.write_text(content)
+    except Exception as e:
+        print(f"{COLOR_RED}Error saving settings: {e}{COLOR_END}")
+
+def save_active_key(key_data: Optional[Dict[str, Any]], paths: Dict[str, Path]):
+    """Saves the currently active key configuration to the dynamic ACTIVE_KEY_PATH."""
+    try:
+        content = json.dumps(key_data, indent=2) if key_data else json.dumps(None)
+        paths['ACTIVE_KEY_PATH'].write_text(content)
+    except Exception as e:
+        print(f"{COLOR_RED}Error saving active key to {paths['ACTIVE_KEY_PATH']}: {e}{COLOR_END}")
+
+def load_active_key(paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+    """Loads the currently active key configuration from the dynamic ACTIVE_KEY_PATH."""
+    active_key_path = paths['ACTIVE_KEY_PATH']
+    if active_key_path.exists():
+        try:
+            content = active_key_path.read_text()
+            data = json.loads(content)
+            if data and all(k in data for k in ['api_key', 'model_name', 'slot_index']):
+                return data
+            save_active_key(None, paths)
+            return None
+        except (json.JSONDecodeError, Exception):
+            save_active_key(None, paths)
+            return None
+    return None
+
+def load_all_key_slots(paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+    """Loads and returns the full api_config.json data from the dynamic CONFIG_PATH."""
+    config_path = paths['CONFIG_PATH']
+    if not config_path.exists():
+        return None
+    try:
+        return json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        print(f"{COLOR_RED}Error: Invalid JSON format in {CONFIG_FILE_NAME}.{COLOR_END}")
+        return None
+    except Exception as e:
+        print(f"{COLOR_RED}Fatal Error loading config: {e}{COLOR_END}")
+        return None
+
+def update_key_slot(config_data: Dict[str, Any], slot_index: int, new_key: str, model_name: str, paths: Dict[str, Path]):
+    """Updates a key slot in the BEJSON structure and saves the file to the dynamic CONFIG_PATH."""
+    config_path = paths['CONFIG_PATH']
+    try:
+        if 0 <= slot_index < len(config_data.get('Values', [])):
+            config_data['Values'][slot_index][1] = model_name
+            config_data['Values'][slot_index][2] = new_key
+            
+            with config_path.open('w') as f:
+                json.dump(config_data, f, indent=2)
+            
+            print(f"{COLOR_GREEN}Slot {slot_index}: Key **updated** successfully.{COLOR_END}")
+        else:
+            print(f"{COLOR_RED}Invalid slot index: {slot_index}.{COLOR_END}")
+    except Exception as e:
+        print(f"{COLOR_RED}Error writing to {config_path.name} in {paths['KEY_CONFIG_DIR']}: {e}{COLOR_END}")
+
+
+def get_available_key_slots(config_data: Dict[str, Any]) -> List[Tuple[int, str, str]]:
+    """Returns a list of tuples: (index, model_name, api_key_snippet) for all available keys."""
+    available_keys = []
+    field_names = [field['name'] for field in config_data.get('Fields', [])]
+    
+    for i, record in enumerate(config_data.get('Values', [])):
+        if len(record) == len(field_names):
+            record_dict = dict(zip(field_names, record))
+            api_key = record_dict.get('api_key', '').strip()
+            
+            if record_dict.get('service_name') == GEMINI_SERVICE_NAME and api_key and not api_key.startswith("YOUR_"):
+                snippet = api_key[:4] + '...' + api_key[-4:]
+                model_name = record_dict.get('model_name', 'N/A')
+                available_keys.append((i, model_name, snippet))
+    
+    return available_keys
+
+def toggle_random_key(config_data: Dict[str, Any], paths: Dict[str, Path], quiet: bool = False) -> Optional[Dict[str, Any]]:
+    """Selects and tests a random available key, setting it as active if successful."""
+    available_keys = get_available_key_slots(config_data)
+    
+    if not available_keys:
+        if not quiet:
+            print(f"{COLOR_YELLOW}No keys found in **{CONFIG_FILE_NAME}** to toggle.{COLOR_END}")
+        return None
+        
+    slot_index, model_name, _ = random.choice(available_keys)
+    api_key = config_data['Values'][slot_index][2]
+    
+    if not quiet:
+        print(f"\nAttempting Slot {slot_index} ({model_name})...")
+        
+    if test_key(api_key, model_name):
+        active_key_info = {
+            'slot_index': slot_index,
+            'model_name': model_name,
+            'api_key': api_key
+        }
+        save_active_key(active_key_info, paths)
+        if not quiet:
+            print(f"{COLOR_GREEN}Key check SUCCESS! Slot {slot_index} is now ACTIVE.{COLOR_END}")
+        return active_key_info
+    else:
+        if not quiet:
+            print(f"{COLOR_RED}Key check FAILED for Slot {slot_index}. Trying again or manage manually.{COLOR_END}")
+        return None
+
+# ==============================================================================
+# --- CLI-SPECIFIC FUNCTION ---
+# ==============================================================================
+
+def activate_random_key_cli():
+    """
+    Picks a random, valid API key from the BEJSON config file 
+    and sets it as active. Designed to be run from the command line.
+    """
+    settings = load_settings()
+    # Pathlib is used internally by get_current_paths for robust Android path handling
+    paths = get_current_paths(settings)
+
+    print(f"{COLOR_YELLOW}🔑 Pydroider CLI: Attempting to activate random key...{COLOR_END}")
+
+    # Load the BEJSON configuration
+    config_data = load_all_key_slots(paths)
+
+    if not config_data:
+        print(f"{COLOR_RED}❌ Error: No API configuration found at {paths['CONFIG_PATH']}. Please run the interactive menu (python3 {Path(__file__).name}) to create the file.{COLOR_END}")
+        sys.exit(1)
+
+    # Re-use existing toggle_random_key function with quiet=False to show terminal output
+    active_key_info = toggle_random_key(config_data, paths, quiet=False)
+
+    if active_key_info:
+        model = active_key_info['model_name']
+        slot = active_key_info['slot_index']
+        # Show path mode for context
+        path_mode = 'Relative' if settings['use_relative_config'] else 'External'
+        
+        print(f"{COLOR_GREEN}✅ Success! Slot {slot} ({model}) is now the ACTIVE key.{COLOR_END}")
+        print(f"   Key Config Mode: {COLOR_CYAN}{path_mode}{COLOR_END} ({paths['ACTIVE_KEY_PATH'].parent})")
+        # Exit successfully after activation
+        sys.exit(0) 
+    else:
+        print(f"{COLOR_RED}❌ Failure: Could not find or activate a valid random key (all keys may be invalid or placeholder).{COLOR_END}")
+        # Exit with error code
+        sys.exit(1) 
+
+
+# ==============================================================================
+# --- CORE MENU LOGIC ---
+# (Includes functions: create_template_config, test_key, setup_api_config, 
+#  manage_key_slot, edit_key_submenu, set_external_paths_submenu, settings_menu)
+# ==============================================================================
+
+def create_template_config(paths: Dict[str, Path]):
+    """Creates the api_config.json file from the BEJSON template at the dynamic path."""
+    key_config_dir = paths['KEY_CONFIG_DIR']
+    config_path = paths['CONFIG_PATH']
+    
+    print(f"{COLOR_RED}Config file NOT found.{COLOR_END}")
+    print(f"🛠️ Creating **{CONFIG_FILE_NAME}** at path: {key_config_dir}...")
+    
+    # Ensure directory exists (especially important for external mode if user hasn't created it)
+    if not key_config_dir.exists():
+        print(f"{COLOR_YELLOW}Warning: Key config directory does not exist. Attempting to create it...{COLOR_END}")
+        try:
+            key_config_dir.mkdir(parents=True, exist_ok=True)
+            print(f"{COLOR_GREEN}Directory created: {key_config_dir}{COLOR_END}")
+        except Exception as e:
+            print(f"{COLOR_RED}🛑 Failed to create directory: {e}{COLOR_END}")
+            input("Press Enter to continue...")
+            return
+
+    try:
+        template_content = json.dumps(BEJSON_CONFIG_TEMPLATE, indent=2)
+        config_path.write_text(template_content)
+        
+        print(f"\n{COLOR_WHITE}-------------------------------------------------------{COLOR_END}")
+        print(f"{COLOR_YELLOW}ACTION REQUIRED: New template created.{COLOR_END}")
+        print(f"Please open **{config_path}** and insert your API key into a slot.{COLOR_END}")
+        print(f"{COLOR_WHITE}-------------------------------------------------------\n{COLOR_END}")
+        
+    except Exception as e:
+        print(f"{COLOR_RED}🛑 Failed to create template file at {config_path}: {e}{COLOR_END}")
+
+def test_key(api_key: str, model_name: str) -> bool:
+    """Tests the given key against the Gemini API."""
+    try:
+        client = genai.Client(api_key=api_key)
+        client.models.list()
+        return True
+    except APIError:
+        return False
+    except Exception:
+        return False
+
+
+def setup_api_config(active_key_info: Optional[Dict[str, Any]], paths: Dict[str, Path]):
+    """Handles the top-level API setup menu."""
+    
+    while True:
+        clear_screen()
+        config_data = load_all_key_slots(paths)
+        
+        if not config_data:
+            create_template_config(paths)
+            return
+
+        print(f"\n{COLOR_WHITE}--- 1. API KEY MANAGER ---{COLOR_END}")
+        # Note: Keeping the path display here as it's relevant to API key files
+        print(f"Config path: {COLOR_CYAN}{paths['KEY_CONFIG_DIR']}{COLOR_END}")
+        print(f"Config file detected: **{CONFIG_FILE_NAME}** ({len(config_data.get('Values', []))} slots)")
+        
+        if active_key_info:
+            index = active_key_info['slot_index']
+            model = active_key_info['model_name']
+            key_snip = active_key_info['api_key'][:4] + '...' + active_key_info['api_key'][-4:]
+            status_text = f"ACTIVE: Slot {index} | Model: {model} | Key: {key_snip}"
+            
+            if test_key(active_key_info['api_key'], model):
+                print(f"Status: {COLOR_GREEN}Key Valid{COLOR_END} | {COLOR_CYAN}{status_text}{COLOR_END}")
+            else:
+                print(f"Status: {COLOR_RED}Key INVALID!{COLOR_END} | {COLOR_CYAN}{status_text}{COLOR_END}")
+                
+        else:
+            print(f"Status: {COLOR_YELLOW}No active key configured.{COLOR_END}")
+
+        print(f"\n{COLOR_WHITE}[ Key Management Options ]{COLOR_END}")
+        
+        print(f"{COLOR_YELLOW}1.{COLOR_END} {COLOR_GREEN}Toggle/Test Random Available Key{COLOR_END}")
+        print(f"{COLOR_YELLOW}2.{COLOR_END} {COLOR_GREEN}Manage Key Slot (Select Slot to Edit){COLOR_END}")
+        
+        print(f"{COLOR_RED}0. Back to Main Menu{COLOR_END}")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+        
+        choice = input("Enter option number: ").strip()
+        
+        if choice == '1':
+            active_key_info = toggle_random_key(config_data, paths, quiet=False)
+            input("Press Enter to continue...")
+        elif choice == '2':
+            active_key_info = manage_key_slot(config_data, paths)
+        elif choice == '0':
+            return
+        else:
+            print(f"{COLOR_RED}Invalid choice.{COLOR_END}")
+            input("Press Enter to continue...")
+
+
+def manage_key_slot(config_data: Dict[str, Any], paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+    """Allows the user to select a slot and then enter/remove a key."""
+    while True:
+        try:
+            clear_screen()
+            total_slots = len(config_data.get('Values', []))
+            print(f"\n{COLOR_WHITE}--- Manage Key Slot (0 to {total_slots-1}) ---{COLOR_END}")
+            
+            for i in range(total_slots):
+                key = config_data['Values'][i][2].strip()
+                model = config_data['Values'][i][1]
+                status = f"{COLOR_GREEN}FILLED ({model}){COLOR_END}" if key else f"{COLOR_YELLOW}EMPTY{COLOR_END}"
+                key_snip = key[:4] + '...' + key[-4:] if key else 'None'
+                print(f"Slot {i}: {status} | Key Snippet: {key_snip}")
+                
+            slot_choice = input(f"Enter slot number (0 to {total_slots-1}) or {COLOR_RED}'Q'{COLOR_END} to quit: ").strip().upper()
+            if slot_choice == 'Q':
+                return load_active_key(paths)
+            
+            slot_index = int(slot_choice)
+            if not (0 <= slot_index < total_slots):
+                print(f"{COLOR_RED}Invalid slot number. Must be between 0 and {total_slots-1}.{COLOR_END}")
+                continue
+                
+            return edit_key_submenu(config_data, slot_index, paths)
+            
+        except ValueError:
+            print(f"{COLOR_RED}Invalid input. Please enter a number or 'Q'.{COLOR_END}")
+        except Exception as e:
+            print(f"{COLOR_RED}An error occurred: {e}{COLOR_END}")
+            return load_active_key(paths)
+
+
+def edit_key_submenu(config_data: Dict[str, Any], slot_index: int, paths: Dict[str, Path]) -> Optional[Dict[str, Any]]:
+    """Sub-menu for a specific slot: enter or remove key."""
+    while True:
+        clear_screen()
+        print(f"\n{COLOR_WHITE}--- Editing Slot {slot_index} ---{COLOR_END}")
+        current_key = config_data['Values'][slot_index][2].strip()
+        current_model = config_data['Values'][slot_index][1]
+        
+        status = f"{COLOR_GREEN}FILLED ({current_model}){COLOR_END}" if current_key else f"{COLOR_YELLOW}EMPTY{COLOR_END}"
+        print(f"Current Status: {status}")
+        
+        print(f"{COLOR_YELLOW}1.{COLOR_END} {COLOR_GREEN}Enter/Update API Key and Model{COLOR_END}")
+        print(f"{COLOR_YELLOW}2.{COLOR_END} {COLOR_GREEN}Remove Key (Set to empty string){COLOR_END}")
+        
+        print(f"{COLOR_RED}0. Back to Slot Selection{COLOR_END}")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+        
+        choice = input("Enter option number: ").strip()
+        
+        if choice == '1':
+            new_key = input("Enter the full new Gemini API key: ").strip()
+            new_model = input(f"Enter model name (Default: {MODEL_DEFAULT}): ").strip() or MODEL_DEFAULT
+            
+            if not new_key:
+                print(f"{COLOR_RED}Key cannot be empty.{COLOR_END}")
+                continue
+
+            print("\nTesting new key...")
+            if test_key(new_key, new_model):
+                update_key_slot(config_data, slot_index, new_key, new_model, paths)
+                
+                active_key_info = {
+                    'slot_index': slot_index,
+                    'model_name': new_model,
+                    'api_key': new_key
+                }
+                save_active_key(active_key_info, paths)
+                print(f"{COLOR_GREEN}Slot {slot_index} successfully updated and set as ACTIVE.{COLOR_END}")
+                return active_key_info
+            else:
+                print(f"{COLOR_RED}New key FAILED test. Not saving.{COLOR_END}")
+                
+        elif choice == '2':
+            update_key_slot(config_data, slot_index, "", MODEL_DEFAULT, paths)
+            
+            active_info = load_active_key(paths)
+            if active_info and active_info.get('slot_index') == slot_index:
+                save_active_key(None, paths)
+                print(f"{COLOR_YELLOW}Active key cleared as slot {slot_index} was removed.{COLOR_END}")
+
+            print(f"{COLOR_GREEN}Key in Slot {slot_index} removed.{COLOR_END}")
+            
+        elif choice == '0':
+            return load_active_key(paths)
+        else:
+            print(f"{COLOR_RED}Invalid choice.{COLOR_END}")
+            
+        config_data = load_all_key_slots(paths) 
+        if not config_data:
+            return None
+            
+
+def set_external_paths_submenu(settings: Dict[str, Any]):
+    """Allows user to set the absolute path for external config files."""
+    while True:
+        clear_screen()
+        current_path = settings['external_config_dir']
+        
+        print(f"\n{COLOR_WHITE}--- SET EXTERNAL KEY CONFIG PATH ---{COLOR_END}")
+        print(f"Current Path: {COLOR_CYAN}{current_path}{COLOR_END}")
+        print(f"Note: This path should point to the directory containing {CONFIG_FILE_NAME}.")
+        print(f"Example: /storage/emulated/0/BEJSON/Python-Linux/Scripts/config")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+        
+        new_path = input("Enter new ABSOLUTE directory path: ").strip()
+        
+        if not new_path:
+            print(f"{COLOR_RED}Path cannot be empty.{COLOR_END}")
+            input("Press Enter to continue...")
+            continue
+            
+        try:
+            Path(new_path).expanduser()
+            settings['external_config_dir'] = new_path
+            save_settings(settings)
+            print(f"{COLOR_GREEN}External path updated successfully.{COLOR_END}")
+            input("Press Enter to continue...")
+            return
+        except Exception as e:
+            print(f"{COLOR_RED}Invalid path format or permissions: {e}{COLOR_END}")
+            input("Press Enter to continue...")
+
+
+def settings_menu():
+    """Menu to manage application settings like key loading mode and path mode."""
+    while True:
+        clear_screen()
+        settings = load_settings()
+        paths = get_current_paths(settings) # Re-calculate paths for display
+        
+        load_mode = settings['load_mode']
+        is_relative = settings['use_relative_config']
+        path_status = "Relative (ON)" if is_relative else "External (OFF)"
+        
+        print(f"\n{COLOR_WHITE}--- 2. APPLICATION SETTINGS ---{COLOR_END}")
+        print(f"1. Key Loading Mode: {COLOR_CYAN}{load_mode.upper()}{COLOR_END}")
+        print(f"2. Config Path Mode: {COLOR_CYAN}{path_status}{COLOR_END}")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+
+        # DISPLAY FILE SYSTEM PATHS HERE (as requested)
+        print(f"{COLOR_WHITE}[ Current Paths ]{COLOR_END}")
+        print(f"Key Config Dir: {COLOR_CYAN}{paths['KEY_CONFIG_DIR']}{COLOR_END}")
+        print(f"App Settings Dir: {COLOR_CYAN}{SCRIPT_DIR}{COLOR_END}")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+        
+        print(f"{COLOR_WHITE}[ Option Selection ]{COLOR_END}")
+        
+        # Option 1: Toggle Load Mode
+        mode_toggle_text = "Random Working Key" if load_mode == 'last' else "Last Active Key (Recommended)"
+        print(f"{COLOR_YELLOW}1.{COLOR_END} {COLOR_GREEN}Toggle Key Loading Mode ({mode_toggle_text}){COLOR_END}")
+        
+        # Option 2: Toggle Path Mode
+        path_toggle_text = "External/Absolute Path" if is_relative else "Relative/Local Path"
+        print(f"{COLOR_YELLOW}2.{COLOR_END} {COLOR_GREEN}Toggle Key Config Path Mode ({path_toggle_text}){COLOR_END}")
+        
+        # Option 3: Set External Path (Only visible/useful when not relative)
+        if not is_relative:
+            print(f"{COLOR_YELLOW}3.{COLOR_END} {COLOR_GREEN}Set Absolute External Key Config Directory{COLOR_END}")
+            
+        print(f"{COLOR_RED}0. Back to Main Menu{COLOR_END}")
+        print(f"{COLOR_WHITE}---------------------------------------{COLOR_END}")
+        
+        choice = input("Enter option number: ").strip()
+        
+        if choice == '1':
+            new_mode = 'last' if load_mode == 'random' else 'random'
+            settings['load_mode'] = new_mode
+            save_settings(settings)
+            print(f"{COLOR_GREEN}Key loading mode set to: {new_mode.upper()}{COLOR_END}")
+            input("Press Enter to continue...")
+            
+        elif choice == '2':
+            settings['use_relative_config'] = not is_relative
+            save_settings(settings)
+            new_path_status = "External" if not settings['use_relative_config'] else "Relative"
+            print(f"{COLOR_GREEN}Key Config Path Mode set to: {new_path_status}{COLOR_END}")
+            input("Press Enter to continue...")
+
+        elif choice == '3' and not is_relative:
+            set_external_paths_submenu(settings)
+            
+        elif choice == '0':
+            return
+        else:
+            print(f"{COLOR_RED}Invalid choice.{COLOR_END}")
+            input("Press Enter to continue...")
+
+
+# ==============================================================================
+# --- MAIN EXECUTION ---
+# ==============================================================================
+
+def display_menu():
+    """Displays the main menu and handles user input."""
+    
+    print(f"Script ID: {SCRIPT_ID}")
+    
+    while True:
+        clear_screen()
+        
+        # 1. Load Settings and Determine Paths
+        settings = load_settings()
+        paths = get_current_paths(settings)
+        
+        load_mode = settings['load_mode']
+        is_relative = settings['use_relative_config']
+        
+        # 2. Key Loading Logic (Needs paths)
+        active_key_info = None
+        config_data = load_all_key_slots(paths)
+
+        if config_data:
+            if load_mode == 'last':
+                active_key_info = load_active_key(paths)
+                
+                if active_key_info and not test_key(active_key_info['api_key'], active_key_info['model_name']):
+                    save_active_key(None, paths)
+                    active_key_info = toggle_random_key(config_data, paths, quiet=True) 
+            
+            elif load_mode == 'random':
+                active_key_info = toggle_random_key(config_data, paths, quiet=True)
+                
+        
+        # 3. Determine Display Strings
+        # key_config_dir_display = str(paths['KEY_CONFIG_DIR']) # REMOVED from main menu
+        path_type_display = "Relative" if is_relative else "External"
+        
+        if active_key_info:
+            model = active_key_info['model_name']
+            slot = active_key_info['slot_index'] 
+            
+            status_line = f"{COLOR_GREEN}✔️ READY{COLOR_END} | Status: Key Valid"
+            key_display = f"Key: {COLOR_YELLOW}Slot {slot}{COLOR_END} / Model: {COLOR_CYAN}{model}{COLOR_END}"
+        else:
+            status_line = f"{COLOR_RED}🛑 API NOT READY{COLOR_END} | Status: No Valid Key Found"
+            key_display = f"{COLOR_RED}No Active Key Loaded. Please run Setup.{COLOR_END}" 
+
+        print(f"\n{COLOR_WHITE}======================================================={COLOR_END}")
+        print(f"{COLOR_WHITE}   Pydroider Expert - Gemini Utility Menu (ID: {SCRIPT_ID}){COLOR_END}")
+        print(f"   {status_line}")
+        print(f"   {key_display}")
+        # Only Mode and Key Path Mode status are shown, not the full directory paths
+        print(f"   Mode: {COLOR_YELLOW}{load_mode.upper()}{COLOR_END} | Key Path Mode: {COLOR_YELLOW}{path_type_display}{COLOR_END}")
+        print(f"{COLOR_WHITE}======================================================={COLOR_END}")
+        
+        # Menu Options
+        print(f"{COLOR_YELLOW}1.{COLOR_END} {COLOR_GREEN}Setup API (Key Manager){COLOR_END}")
+        print(f"{COLOR_YELLOW}2.{COLOR_END} {COLOR_GREEN}Application Settings{COLOR_END}")
+        
+        # Option 0: Exit (RED)
+        print(f"{COLOR_RED}0. Exit{COLOR_END}")
+        
+        print(f"{COLOR_WHITE}-------------------------------------------------------{COLOR_END}")
+        
+        choice = input("Enter option number: ").strip()
+        
+        if choice == '1':
+            setup_api_config(active_key_info, paths)
+        elif choice == '2':
+            settings_menu()
+        elif choice == '0':
+            print(f"{COLOR_YELLOW}Exiting script. Goodbye!{COLOR_END}")
+            break
+        else:
+            print(f"{COLOR_RED}Invalid choice. Please enter '1', '2' or '0'.{COLOR_END}")
+
+
+if __name__ == "__main__":
+    
+    # 1. Setup Argument Parser for CLI mode
+    parser = argparse.ArgumentParser(
+        description="Pydroider Expert - Gemini Key Manager (Interactive Menu & CLI).",
+        formatter_class=argparse.RawTextHelpFormatter # Keeps help message formatting clean
+    )
+    
+    parser.add_argument(
+        '--activate-random-key', 
+        action='store_true', 
+        help="Picks a random, valid API key from api_config.json, sets it as active, and then exits."
+    )
+    
+    args = parser.parse_args()
+
+    # 2. Execute based on Arguments
+    if args.activate_random_key:
+        # If the flag is provided, run the CLI function and exit
+        activate_random_key_cli()
+    else:
+        # If no flag is provided, run the existing interactive menu
+        display_menu()
